@@ -18,19 +18,27 @@
 
 package org.apache.flink.table.plan.nodes.physical.batch
 
+import org.apache.flink.api.common.typeinfo.BasicTypeInfo
 import org.apache.flink.api.dag.Transformation
+import org.apache.flink.api.java.sampling.IntermediateSampleData
+import org.apache.flink.api.java.tuple.Tuple2
+import org.apache.flink.api.java.typeutils.{TupleTypeInfo, TypeExtractor}
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.runtime.io.network.DataExchangeMode
 import org.apache.flink.runtime.operators.DamBehavior
-import org.apache.flink.streaming.api.transformations.{PartitionTransformation, ShuffleMode}
-import org.apache.flink.streaming.runtime.partitioner.{BroadcastPartitioner, GlobalPartitioner, RebalancePartitioner}
+import org.apache.flink.streaming.api.transformations.{OneInputTransformation, PartitionTransformation, ShuffleMode, TwoInputTransformation}
+import org.apache.flink.streaming.runtime.partitioner.{BroadcastPartitioner, CustomPartitionerWrapper, ForwardPartitioner, GlobalPartitioner, RebalancePartitioner}
 import org.apache.flink.table.api.BatchTableEnvironment
 import org.apache.flink.table.calcite.FlinkTypeFactory
-import org.apache.flink.table.codegen.{CodeGeneratorContext, HashCodeGenerator}
+import org.apache.flink.table.codegen.sort.SortCodeGenerator
+import org.apache.flink.table.codegen.{CodeGeneratorContext, HashCodeGenerator, ProjectionCodeGenerator}
 import org.apache.flink.table.dataformat.BaseRow
+import org.apache.flink.table.plan.`trait`.FlinkRelDistribution
 import org.apache.flink.table.plan.nodes.common.CommonPhysicalExchange
 import org.apache.flink.table.plan.nodes.exec.{BatchExecNode, ExecNode}
+import org.apache.flink.table.plan.util.SortUtil
 import org.apache.flink.table.runtime.BinaryHashPartitioner
+import org.apache.flink.table.runtime.range.{AssignRangeIndexOperator, FirstIntFieldKeyExtractor, IdPartitioner, KeyExtractor, LocalSampleOperator, RemoveRangeIndexOperator, SampleAndHistogramOperator}
 import org.apache.flink.table.types.logical.RowType
 import org.apache.flink.table.typeutils.BaseRowTypeInfo
 
@@ -98,11 +106,20 @@ class BatchExecExchange(
   with BatchPhysicalRel
   with BatchExecNode[BaseRow] {
 
+  private val SIP_NAME = "RangePartition: LocalSample"
+  private val SIC_NAME = "RangePartition: SampleAndHistogram"
+  private val ARI_NAME = "RangePartition: PreparePartition"
+  private val PR_NAME = "RangePartition: Partition"
+  private val TOTAL_SAMPLE_SIZE = 655360
+  private val TOTAL_RANGES_NUM = 65536
+
   // TODO reuse PartitionTransformation
   // currently, an Exchange' input transformation will be reused if it is reusable,
   // and different PartitionTransformation objects will be created which have same input.
   // cache input transformation to reuse
   private var reusedInput: Option[Transformation[BaseRow]] = None
+  // cache sampleAndHistogram transformation to reuse when distribution is RANGE
+  private var reusedSampleAndHistogram: Option[Transformation[Array[Array[AnyRef]]]] = None
   // the required exchange mode for reusable ExchangeBatchExec
   // if it's None, use value from getDataExchangeMode
   private var requiredExchangeMode: Option[DataExchangeMode] = None
@@ -190,6 +207,9 @@ class BatchExecExchange(
         transformation.setOutputType(outputRowType)
         transformation
 
+      case RelDistribution.Type.RANGE_DISTRIBUTED =>
+        getRangePartitionPlan(inputType, tableEnv, input)
+
       case RelDistribution.Type.RANDOM_DISTRIBUTED =>
         val transformation = new PartitionTransformation(
           input,
@@ -227,6 +247,132 @@ class BatchExecExchange(
         throw new UnsupportedOperationException(
           s"not support RelDistribution: ${relDistribution.getType} now!")
     }
+  }
+
+  /**
+    * The RelNode with range-partition distribution will create the following transformations.
+    *
+    * ------------------------- BATCH --------------------------> [B, m] -->...
+    * /                                                            /
+    * [A, n] --> [LocalSample, n] --> [SampleAndHistogram, 1] --BROADCAST-<
+    * \                                                            \
+    * ------------------------- BATCH --------------------------> [C, o] -->...
+    *
+    * Transformations of LocalSample and SampleAndHistogram can be reused.
+    * The streams except the sample and histogram process stream will been blocked,
+    * so the the sample and histogram process stream does not care about requiredExchangeMode.
+    */
+  protected def getRangePartitionPlan(
+      inputType: BaseRowTypeInfo,
+      tableEnv: BatchTableEnvironment,
+      input: Transformation[BaseRow]): Transformation[BaseRow] = {
+    val fieldCollations = relDistribution.asInstanceOf[FlinkRelDistribution].getFieldCollations.get
+    val conf = tableEnv.getConfig
+
+    val (keys, orders, nullsIsLast) = SortUtil.getKeysAndOrders(fieldCollations)
+    val types = inputType.getLogicalTypes
+
+    val sampleAndHistogram = reusedSampleAndHistogram match {
+      case Some(transformation) => transformation
+      case None =>
+        // 1. Fixed size sample in each partitions.
+        val localSampleOutRowType = RowType.of(keys.map(types(_)): _ *)
+
+        val localSampleProjection = ProjectionCodeGenerator.generateProjection(
+          CodeGeneratorContext(tableEnv.getConfig),
+          "LocalSample",
+          inputType.toRowType,
+          localSampleOutRowType,
+          keys,
+          reusedOutRecord = false)
+
+        val isdType = TypeExtractor.getForClass(classOf[IntermediateSampleData[BaseRow]])
+        val localSample = new OneInputTransformation(
+          input,
+          SIP_NAME,
+          new LocalSampleOperator(localSampleProjection, TOTAL_SAMPLE_SIZE),
+          isdType,
+          input.getParallelism)
+
+        // 2. Fixed size sample in a single coordinator
+        // and use sampled data to build range boundaries.
+        val sampleTypes = keys.map(types(_))
+        val sampleType = RowType.of(sampleTypes: _*)
+        val ctx = CodeGeneratorContext(tableEnv.getConfig)
+        val copyToBinaryRow = ProjectionCodeGenerator.generateProjection(
+          ctx,
+          "CopyToBinaryRow",
+          localSampleOutRowType,
+          sampleType,
+          localSampleOutRowType.getChildren.indices.toArray,
+          reusedOutRecord = false)
+        val boundariesType = TypeExtractor.getForClass(classOf[Array[Array[AnyRef]]])
+        val newKeyIndexes = keys.indices.toArray
+        val generator = new SortCodeGenerator(
+          conf,
+          newKeyIndexes,
+          sampleTypes,
+          orders,
+          nullsIsLast)
+        val sampleAndHistogram = new OneInputTransformation(
+          localSample,
+          SIC_NAME,
+          new SampleAndHistogramOperator(
+            TOTAL_SAMPLE_SIZE,
+            copyToBinaryRow,
+            generator.generateRecordComparator("SampleAndHistogramComparator"),
+            new KeyExtractor(
+              newKeyIndexes,
+              orders,
+              newKeyIndexes.map(sampleTypes(_))),
+            TOTAL_RANGES_NUM),
+          boundariesType,
+          1)
+        reusedSampleAndHistogram = Some(sampleAndHistogram)
+        sampleAndHistogram
+    }
+
+    // 3. Add broadcast shuffle
+    val broadcast: PartitionTransformation[Array[Array[AnyRef]]] = new PartitionTransformation(
+      sampleAndHistogram,
+      new BroadcastPartitioner[Array[Array[AnyRef]]],
+      ShuffleMode.PIPELINED)
+
+    // 4. add batch dataExchange
+    val batchExchange: PartitionTransformation[BaseRow] = new PartitionTransformation(
+      input,
+      new ForwardPartitioner[BaseRow],
+      ShuffleMode.BATCH)
+
+    // 4. Take range boundaries as broadcast input and take the tuple of partition id and
+    // record as output.
+    // TwoInputTransformation, it must be binaryRow.
+    val binaryType = new BaseRowTypeInfo(types: _*)
+    val preparePartition =
+      new TwoInputTransformation[Array[Array[AnyRef]], BaseRow, Tuple2[Integer, BaseRow]](
+        broadcast,
+        batchExchange,
+        ARI_NAME,
+        new AssignRangeIndexOperator(
+          new KeyExtractor(keys, orders, keys.map(binaryType.getLogicalTypes()(_)))),
+        new TupleTypeInfo[Tuple2[Integer, BaseRow]](BasicTypeInfo.INT_TYPE_INFO, binaryType),
+        input.getParallelism)
+
+    // 5. Add shuffle according range partition.
+    val rangePartition = new PartitionTransformation(
+      preparePartition,
+      new CustomPartitionerWrapper(
+        new IdPartitioner(TOTAL_RANGES_NUM),
+        new FirstIntFieldKeyExtractor),
+      ShuffleMode.PIPELINED)
+
+    // 6. Remove the partition id.
+    new OneInputTransformation(
+      rangePartition,
+      PR_NAME,
+      new RemoveRangeIndexOperator(),
+      binaryType,
+      getResource.getParallelism)
   }
 }
 

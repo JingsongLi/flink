@@ -20,8 +20,14 @@ package org.apache.flink.table.runtime.sort;
 
 import org.apache.flink.api.common.typeutils.base.NormalizedKeyUtil;
 import org.apache.flink.core.memory.MemorySegment;
+import org.apache.flink.table.dataformat.BaseArray;
+import org.apache.flink.table.dataformat.BaseRow;
 import org.apache.flink.table.dataformat.BinaryString;
 import org.apache.flink.table.dataformat.Decimal;
+import org.apache.flink.table.dataformat.TypeGetterSetters;
+import org.apache.flink.table.types.logical.ArrayType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
 
 import java.nio.ByteOrder;
 
@@ -209,5 +215,110 @@ public class SortUtil {
 
 	private static boolean lessThanUnsigned(long x1, long x2) {
 		return (x1 + Long.MIN_VALUE) < (x2 + Long.MIN_VALUE);
+	}
+
+	public static int compareNullable(LogicalType type, Object first, Object second) {
+		// both values are null -> equality
+		if (first == null && second == null) {
+			return 0;
+		}
+		// first value is null -> inequality
+		// but order is considered
+		else if (first == null) {
+			return -1;
+		}
+		// second value is null -> inequality
+		// but order is considered
+		else if (second == null) {
+			return 1;
+		}
+		return compare(type, first, second);
+	}
+
+	/**
+	 * Compare two internal data format with type.
+	 */
+	public static int compare(LogicalType type, Object first, Object second) {
+		switch (type.getTypeRoot()) {
+			case CHAR:
+			case VARCHAR:
+			case BOOLEAN:
+			case DECIMAL:
+			case TINYINT:
+			case SMALLINT:
+			case INTEGER:
+			case BIGINT:
+			case FLOAT:
+			case DOUBLE:
+			case DATE:
+			case TIME_WITHOUT_TIME_ZONE:
+			case TIMESTAMP_WITHOUT_TIME_ZONE:
+			case INTERVAL_YEAR_MONTH:
+			case INTERVAL_DAY_TIME:
+			case ANY:
+				return ((Comparable) first).compareTo(second);
+			case BINARY:
+			case VARBINARY:
+				return compareBinary((byte[]) first, (byte[]) second);
+			case ARRAY:
+				return compareArray((ArrayType) type, (BaseArray) first, (BaseArray) second);
+			case ROW:
+				return compareRow((RowType) type, (BaseRow) first, (BaseRow) second);
+			default:
+				throw new RuntimeException("Not support yet: " + type);
+		}
+	}
+
+	public static int compareArray(ArrayType type, BaseArray leftArray, BaseArray rightArray) {
+		int minLen = Math.min(leftArray.numElements(), rightArray.numElements());
+		for (int i = 0; i < minLen; i++) {
+			boolean isNullLeft = leftArray.isNullAt(i);
+			boolean isNullRight = rightArray.isNullAt(i);
+			if (isNullLeft && isNullRight) {
+				// Do nothing.
+			} else if (isNullLeft) {
+				return -1;
+			} else if (isNullRight) {
+				return 1;
+			} else {
+				LogicalType elementType = type.getElementType();
+				Object o1 = TypeGetterSetters.get(leftArray, i, elementType);
+				Object o2 = TypeGetterSetters.get(rightArray, i, elementType);
+				int comp = compare(elementType, o1, o2);
+				if (comp != 0) {
+					return comp;
+				}
+			}
+		}
+		if (leftArray.numElements() < rightArray.numElements()) {
+			return -1;
+		} else if (rightArray.numElements() > rightArray.numElements()) {
+			return 1;
+		} else {
+			return 0;
+		}
+	}
+
+	public static int compareRow(RowType type, BaseRow leftRow, BaseRow rightRow) {
+		for (int i = 0; i < type.getFieldCount(); i++) {
+			boolean isNullLeft = leftRow.isNullAt(i);
+			boolean isNullRight = rightRow.isNullAt(i);
+			if (isNullLeft && isNullRight) {
+				// Do nothing.
+			} else if (isNullLeft) {
+				return -1;
+			} else if (isNullRight) {
+				return 1;
+			} else {
+				LogicalType elementType = type.getTypeAt(i);
+				Object o1 = TypeGetterSetters.get(leftRow, i, elementType);
+				Object o2 = TypeGetterSetters.get(rightRow, i, elementType);
+				int comp = compare(elementType, o1, o2);
+				if (comp != 0) {
+					return comp;
+				}
+			}
+		}
+		return 0;
 	}
 }

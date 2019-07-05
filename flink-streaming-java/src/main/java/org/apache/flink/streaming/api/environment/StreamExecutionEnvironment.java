@@ -50,6 +50,7 @@ import org.apache.flink.configuration.ConfigConstants;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.runtime.jobgraph.ScheduleMode;
 import org.apache.flink.runtime.state.AbstractStateBackend;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.StateBackend;
@@ -146,6 +147,7 @@ public abstract class StreamExecutionEnvironment {
 
 	protected final List<Tuple2<String, DistributedCache.DistributedCacheEntry>> cacheFile = new ArrayList<>();
 
+	protected ScheduleMode scheduleMode = null;
 
 	// --------------------------------------------------------------------------------------------
 	// Constructor and Properties
@@ -163,6 +165,10 @@ public abstract class StreamExecutionEnvironment {
 	*/
 	public List<Tuple2<String, DistributedCache.DistributedCacheEntry>> getCachedFiles() {
 		return cacheFile;
+	}
+
+	public void setScheduleMode(ScheduleMode scheduleMode) {
+		this.scheduleMode = scheduleMode;
 	}
 
 	/**
@@ -1529,12 +1535,16 @@ public abstract class StreamExecutionEnvironment {
 		if (transformations.size() <= 0) {
 			throw new IllegalStateException("No operators defined in streaming topology. Cannot execute.");
 		}
-		return new StreamGraphGenerator(transformations, config, checkpointCfg)
-			.setStateBackend(defaultStateBackend)
-			.setChaining(isChainingEnabled)
-			.setUserArtifacts(cacheFile)
-			.setTimeCharacteristic(timeCharacteristic)
-			.setDefaultBufferTimeout(bufferTimeout);
+		StreamGraphGenerator generator = new StreamGraphGenerator(transformations, config, checkpointCfg)
+				.setStateBackend(defaultStateBackend)
+				.setChaining(isChainingEnabled)
+				.setUserArtifacts(cacheFile)
+				.setTimeCharacteristic(timeCharacteristic)
+				.setDefaultBufferTimeout(bufferTimeout);
+		if (scheduleMode != null) {
+			generator.setScheduleMode(scheduleMode);
+		}
+		return generator;
 	}
 
 	/**

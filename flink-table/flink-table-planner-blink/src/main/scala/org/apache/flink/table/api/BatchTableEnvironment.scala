@@ -113,6 +113,7 @@ abstract class BatchTableEnvironment(
   override def execute(jobName: String): JobExecutionResult = {
     generateStreamGraph(jobName)
     // TODO supports streamEnv.execute(streamGraph)
+    streamEnv.setScheduleMode(ScheduleMode.LAZY_FROM_SOURCES)
     streamEnv.execute(jobName)
   }
 
