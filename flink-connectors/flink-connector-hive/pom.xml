@@ -220,6 +220,18 @@ under the License.
 			<version>${project.version}</version>
 		</dependency>
 
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-connector-base</artifactId>
+			<version>${project.version}</version>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-connector-files</artifactId>
+			<version>${project.version}</version>
+		</dependency>
+
 		<!-- Hadoop dependency -->
 		<!-- Hadoop as provided dependencies, so we can depend on them without pulling in Hadoop -->
 
@@ -909,6 +921,8 @@ under the License.
 									<include>org.apache.flink:flink-hadoop-compatibility_${scala.binary.version}</include>
 									<include>org.apache.flink:flink-parquet_${scala.binary.version}</include>
 									<include>org.apache.flink:flink-hadoop-bulk_${scala.binary.version}</include>
+									<include>org.apache.flink:flink-connector-base</include>
+									<include>org.apache.flink:flink-connector-files</include>
 									<include>org.apache.parquet:parquet-hadoop</include>
 									<include>org.apache.parquet:parquet-format</include>
 									<include>org.apache.parquet:parquet-column</include>

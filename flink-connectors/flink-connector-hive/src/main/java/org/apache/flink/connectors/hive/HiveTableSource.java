@@ -19,14 +19,17 @@
 package org.apache.flink.connectors.hive;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.IllegalConfigurationException;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.connector.file.src.FileSource;
 import org.apache.flink.connectors.hive.read.HiveContinuousMonitoringFunction;
 import org.apache.flink.connectors.hive.read.HiveTableFileInputFormat;
 import org.apache.flink.connectors.hive.read.HiveTableInputFormat;
 import org.apache.flink.connectors.hive.read.TimestampedHiveInputSplit;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -60,7 +63,9 @@ import org.apache.flink.table.sources.ProjectableTableSource;
 import org.apache.flink.table.sources.StreamTableSource;
 import org.apache.flink.table.sources.TableSource;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.utils.TableConnectorUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.TimeUtils;
@@ -87,6 +92,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.flink.table.catalog.hive.util.HiveTableUtil.checkAcidTable;
 import static org.apache.flink.table.filesystem.DefaultPartTimeExtractor.toLocalDateTime;
@@ -124,6 +130,7 @@ public class HiveTableSource implements
 	private boolean isLimitPushDown = false;
 	private long limit = -1L;
 	private Duration hiveTableCacheTTL;
+	private StorageDescriptor sd;
 
 	public HiveTableSource(
 			JobConf jobConf, ReadableConfig flinkConf, ObjectPath tablePath, CatalogTable catalogTable) {
@@ -170,23 +177,43 @@ public class HiveTableSource implements
 	@Override
 	public DataStream<RowData> getDataStream(StreamExecutionEnvironment execEnv) {
 		checkAcidTable(catalogTable, tablePath);
-		List<HiveTablePartition> allHivePartitions = initAllPartitions();
+		List<HiveTablePartition> allPartitions = initAllPartitions();
 
 		@SuppressWarnings("unchecked")
 		TypeInformation<RowData> typeInfo =
 				(TypeInformation<RowData>) TypeInfoDataTypeConverter.fromDataTypeToTypeInfo(getProducedDataType());
+		RowType tableRowType = (RowType) catalogTable.getSchema().toPhysicalRowDataType().getLogicalType();
+		LogicalType[] fieldTypes =
+				tableRowType.getFields().stream().map(RowType.RowField::getType).toArray(LogicalType[]::new);
 
-		HiveTableInputFormat inputFormat = getInputFormat(
-				allHivePartitions,
-				flinkConf.get(HiveOptions.TABLE_EXEC_HIVE_FALLBACK_MAPRED_READER));
+		Boolean mrReader = flinkConf.get(HiveOptions.TABLE_EXEC_HIVE_FALLBACK_MAPRED_READER);
+		HiveTableInputFormat inputFormat = getInputFormat(allPartitions, mrReader);
 
 		if (isStreamingSource()) {
 			if (catalogTable.getPartitionKeys().isEmpty()) {
-				return createStreamSourceForNonPartitionTable(execEnv, typeInfo, inputFormat, allHivePartitions.get(0));
+				return createStreamSourceForNonPartitionTable(
+						execEnv, typeInfo, inputFormat, allPartitions.get(0));
 			} else {
 				return createStreamSourceForPartitionTable(execEnv, typeInfo, inputFormat);
 			}
 		} else {
+			if (!mrReader && HiveFormats.useOrcVectorizedRead(sd, selectedFields(), fieldTypes)) {
+				Path[] paths = allPartitions.stream().map(p ->
+						new Path(p.getStorageDescriptor().getLocation())).toArray(Path[]::new);
+				FileSource.FileSourceBuilder<RowData> builder = FileSource
+						.forBulkFileFormat(HiveFormats.createOrcColumnarRowInputFormat(
+								hiveVersion,
+								hiveShim,
+								jobConf,
+								tableRowType,
+								catalogTable.getPartitionKeys(),
+								selectedFields(),
+								sd),
+								paths);
+				return execEnv
+						.fromSource(builder.build(), WatermarkStrategy.noWatermarks(), "hive-source")
+						.setParallelism(calculateParallelism(inputFormat));
+			}
 			return createBatchSource(execEnv, typeInfo, inputFormat);
 		}
 	}
@@ -200,7 +227,12 @@ public class HiveTableSource implements
 	private DataStream<RowData> createBatchSource(StreamExecutionEnvironment execEnv,
 			TypeInformation<RowData> typeInfo, HiveTableInputFormat inputFormat) {
 		DataStreamSource<RowData> source = execEnv.createInput(inputFormat, typeInfo);
+		int parallelism = calculateParallelism(inputFormat);
+		source.setParallelism(parallelism);
+		return source.name(explainSource());
+	}
 
+	private int calculateParallelism(HiveTableInputFormat inputFormat) {
 		int parallelism = flinkConf.get(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM);
 		if (flinkConf.get(HiveOptions.TABLE_EXEC_HIVE_INFER_SOURCE_PARALLELISM)) {
 			int max = flinkConf.get(HiveOptions.TABLE_EXEC_HIVE_INFER_SOURCE_PARALLELISM_MAX);
@@ -226,8 +258,7 @@ public class HiveTableSource implements
 		}
 		parallelism = limit > 0 ? Math.min(parallelism, (int) limit / 1000) : parallelism;
 		parallelism = Math.max(1, parallelism);
-		source.setParallelism(parallelism);
-		return source.name(explainSource());
+		return parallelism;
 	}
 
 	private DataStream<RowData> createStreamSourceForPartitionTable(
@@ -332,6 +363,13 @@ public class HiveTableSource implements
 		return getProducedTableSchema().toRowDataType().bridgedTo(RowData.class);
 	}
 
+	private int[] selectedFields() {
+		if (projectedFields != null) {
+			return projectedFields;
+		}
+		return IntStream.range(0, getTableSchema().getFieldCount()).toArray();
+	}
+
 	private TableSchema getProducedTableSchema() {
 		TableSchema fullSchema = getTableSchema();
 		if (projectedFields == null) {
@@ -415,6 +453,7 @@ public class HiveTableSource implements
 			String tableName = tablePath.getObjectName();
 			List<String> partitionColNames = catalogTable.getPartitionKeys();
 			Table hiveTable = client.getTable(dbName, tableName);
+			sd = hiveTable.getSd();
 			Properties tableProps = HiveReflectionUtils.getTableMetadata(hiveShim, hiveTable);
 			String ttlStr = tableProps.getProperty(FileSystemOptions.LOOKUP_JOIN_CACHE_TTL.key());
 			hiveTableCacheTTL = ttlStr != null ?
