@@ -20,7 +20,6 @@ package org.apache.flink.orc;
 
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
-import org.apache.flink.connector.base.source.reader.SourceReaderOptions;
 import org.apache.flink.connector.file.src.reader.BulkFormat;
 import org.apache.flink.connector.file.src.util.CheckpointedPosition;
 import org.apache.flink.connector.file.src.util.Pool;
@@ -90,7 +89,7 @@ public abstract class AbstractOrcFileInputFormat<T, BATCH> implements BulkFormat
 			final long splitOffset,
 			final long splitLength) throws IOException {
 
-		final int numBatchesToCirculate = config.getInteger(SourceReaderOptions.ELEMENT_QUEUE_CAPACITY) + 1;
+		final int numBatchesToCirculate = 1;
 		final Pool<OrcReaderBatch<T, BATCH>> poolOfBatches = createPoolOfBatches(filePath, numBatchesToCirculate);
 
 		final RecordReader orcReader = OrcShim.defaultShim().createRecordReader(
